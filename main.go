@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 )
 
 const serverAddr = "0:8080"
+const MaxDSP = 3
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
@@ -27,7 +29,7 @@ func main() {
 		ReadTimeout:  100 * time.Millisecond,
 		WriteTimeout: 100 * time.Millisecond,
 	}
-	log.Printf("starting server %s\n", s.Addr)
+	log.Printf("starting server %s", s.Addr)
 	log.Fatal(s.ListenAndServe())
 }
 
@@ -50,7 +52,7 @@ func HandlerBid(w http.ResponseWriter, r *http.Request) {
 	vars := r.URL.Query()
 
 	dsp, err := strconv.ParseUint(vars.Get("dsp"), 10, 32)
-	if err != nil || dsp > 3 || dsp < 1 {
+	if err != nil || dsp > MaxDSP || dsp < 1 {
 		http.Error(w, "bad dsp parameter", http.StatusBadRequest)
 		return
 	}
@@ -78,30 +80,73 @@ func HandlerBid(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type DspResult struct {
+	DSPId    int
+	BidPrice float64
+}
+type DspResults []DspResult
+
+func (b DspResults) Len() int           { return len(b) }
+func (b DspResults) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
+func (b DspResults) Less(i, j int) bool { return b[i].BidPrice < b[j].BidPrice }
+
 func HandlerAuction(w http.ResponseWriter, r *http.Request) {
 	client := http.Client{
 		Timeout: 100 * time.Millisecond,
 	}
-	wg := sync.WaitGroup{}
-	for dspId := 1; dspId < 4; dspId++ {
-		wg.Add(1)
-		go askDSP(&wg, &client, dspId)
-	}
-	wg.Wait()
-}
-
-func askDSP(wg *sync.WaitGroup, client *http.Client, dspId int) {
-	defer wg.Done()
 	// NOTICE: generate random floor price
 	floor := rand.Float64() * 10
-	bidURL := makeBidURL(floor, dspId)
-	resp, err := client.Get(bidURL)
-	if err != nil {
-		log.Println(err)
-		return
+
+	dspResults := DspResults{}
+	queue := make(chan DspResult, 1)
+
+	allDone := make(chan struct{}, 1)
+	go func() {
+		for dspRes := range queue {
+			dspResults = append(dspResults, dspRes)
+		}
+		log.Println("finished asking DSPs")
+		allDone <- struct{}{}
+	}()
+
+	wgDSP := sync.WaitGroup{}
+	for dspId := 1; dspId < MaxDSP+1; dspId++ {
+		wgDSP.Add(1)
+		go func(innerDSPId int) {
+			err := askDSP(&wgDSP, &client, queue, floor, innerDSPId)
+			if err != nil {
+				log.Printf("error %s during processing DSP %d", err, innerDSPId)
+			}
+		}(dspId)
 	}
-	bidResp, _ := ioutil.ReadAll(resp.Body)
-	log.Println(string(bidResp))
+	wgDSP.Wait()
+	close(queue)
+	<-allDone
+	log.Printf("Got %d results", len(dspResults))
+	for _, k := range dspResults {
+		log.Printf("DSP %d bid price %g", k.DSPId, k.BidPrice)
+	}
+	sort.Sort(dspResults)
+	winner := dspResults[len(dspResults)-1]
+	log.Printf("Highest bid %g from DSP %d", winner.BidPrice, winner.DSPId)
+}
+
+func askDSP(wg *sync.WaitGroup, client *http.Client, qDSPResults chan DspResult, floor float64, dspId int) error {
+	defer wg.Done()
+	log.Printf("asking DSP %d", dspId)
+	bidURL := makeBidURL(floor, dspId)
+	bidResp, err := client.Get(bidURL)
+	if err != nil {
+		return err
+	}
+	bidRespBytes, _ := ioutil.ReadAll(bidResp.Body)
+	resp := Resp{}
+	err = json.Unmarshal(bidRespBytes, &resp)
+	if err != nil {
+		return err
+	}
+	qDSPResults <- DspResult{DSPId: dspId, BidPrice: resp.Price}
+	return nil
 }
 
 func makeBidURL(floor float64, dspId int) string {
